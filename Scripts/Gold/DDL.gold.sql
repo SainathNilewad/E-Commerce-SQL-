@@ -290,67 +290,133 @@ LEFT JOIN gold.dim_date dd
 GO
 
 
-
 -- =============================================================================
 -- Gold Layer: gold.fact_orders
 -- =============================================================================
 -- Grain: one row per order.
--- Combines item, payment and review information at order level
--- to avoid double counting in business analysis and dashboards.
+--
+-- Purpose:
+--   Creates an order-level view by aggregating item, payment and review data
+--   before joining them to the orders table.
+--
+-- Why:
+--   The source tables can contain multiple rows for the same order.
+--   Aggregating them first prevents double counting in analytics and dashboards.
+--
+-- Contains:
+--   - Order information
+--   - Customer information
+--   - Item and seller metrics
+--   - Payment metrics
+--   - Review score
+--   - Delivery metrics
+--   - Business flags
 -- =============================================================================
+
+
+-- -----------------------------------------------------------------------------
+-- Drop existing view if it already exists
+-- -----------------------------------------------------------------------------
 
 IF OBJECT_ID('gold.fact_orders', 'V') IS NOT NULL
     DROP VIEW gold.fact_orders;
 GO
 
+
+-- -----------------------------------------------------------------------------
+-- Create order-level fact view
+-- -----------------------------------------------------------------------------
+
 CREATE VIEW gold.fact_orders AS
-WITH items AS (
+
+WITH item_summary AS (
+    
+    -- One row per order from order_items
     SELECT
         order_id,
         COUNT(*) AS item_count,
         COUNT(DISTINCT seller_id) AS seller_count,
-        SUM(price) AS total_price,
-        SUM(freight_value) AS total_freight
+        SUM(price) AS items_value,
+        SUM(freight_value) AS freight_value
     FROM silver.order_items
     GROUP BY order_id
 ),
-payments AS (
+
+payment_summary AS (
+
+    -- One row per order from order_payments
     SELECT
         order_id,
-        SUM(payment_value) AS total_payment
+        SUM(payment_value) AS payment_value,
+        MAX(payment_installments) AS max_installments,
+        COUNT(DISTINCT payment_type) AS payment_type_count
     FROM silver.order_payments
     GROUP BY order_id
 ),
-reviews AS (
+
+review_summary AS (
+
+    -- One row per order from order_reviews
     SELECT
         order_id,
-        AVG(review_score) AS review_score
+        AVG(CAST(review_score AS DECIMAL(4,2))) AS review_score
     FROM silver.order_reviews
     GROUP BY order_id
 )
 
+
+-- -----------------------------------------------------------------------------
+-- Combine all order-level information
+-- -----------------------------------------------------------------------------
+
 SELECT
+
+    -- Order information
     o.order_id,
-    c.customer_key,
+    o.order_status,
+
+    -- Customer information
+    o.customer_id,
     c.customer_unique_id,
     c.customer_state,
+    c.customer_city,
 
-    d.date_key AS purchase_date_key,
-
-    o.order_status,
+    -- Order dates
     o.order_purchase_timestamp,
+    CAST(o.order_purchase_timestamp AS DATE) AS purchase_date,
+
+    DATEFROMPARTS(
+        YEAR(o.order_purchase_timestamp),
+        MONTH(o.order_purchase_timestamp),
+        1
+    ) AS purchase_month,
+
     o.order_delivered_customer_date,
     o.order_estimated_delivery_date,
 
+    -- Item information
     i.item_count,
     i.seller_count,
-    i.total_price,
-    i.total_freight,
+    i.items_value,
+    i.freight_value,
 
-    p.total_payment,
+    -- Payment information
+    p.payment_value,
+    p.max_installments,
+    p.payment_type_count,
 
+    -- Review information
     r.review_score,
 
+    -- Delivery flag
+    CASE
+        WHEN o.order_status = 'delivered'
+         AND o.order_delivered_customer_date IS NOT NULL
+        THEN 1
+        ELSE 0
+    END AS is_delivered,
+
+    -- Actual delivery time in days
     CASE
         WHEN o.order_status = 'delivered'
          AND o.order_delivered_customer_date IS NOT NULL
@@ -359,16 +425,34 @@ SELECT
             o.order_purchase_timestamp,
             o.order_delivered_customer_date
         )
+        ELSE NULL
     END AS delivery_days,
 
+    -- Difference between estimated and actual delivery
+    -- Positive  = delivered late
+    -- Negative  = delivered early
     CASE
         WHEN o.order_status = 'delivered'
          AND o.order_delivered_customer_date IS NOT NULL
-         AND o.order_delivered_customer_date > o.order_estimated_delivery_date
+        THEN DATEDIFF(
+            DAY,
+            o.order_estimated_delivery_date,
+            o.order_delivered_customer_date
+        )
+        ELSE NULL
+    END AS delay_days,
+
+    -- Late delivery flag
+    CASE
+        WHEN o.order_status = 'delivered'
+         AND o.order_delivered_customer_date IS NOT NULL
+         AND CAST(o.order_delivered_customer_date AS DATE)
+             > CAST(o.order_estimated_delivery_date AS DATE)
         THEN 1
         ELSE 0
     END AS is_late,
 
+    -- Valid sale flag
     CASE
         WHEN i.order_id IS NULL
           OR o.order_status IN ('canceled', 'unavailable')
@@ -378,23 +462,32 @@ SELECT
 
 FROM silver.orders o
 
-LEFT JOIN gold.dim_customers c
+-- Customer information
+LEFT JOIN silver.customers c
     ON o.customer_id = c.customer_id
 
-LEFT JOIN gold.dim_date d
-    ON CAST(o.order_purchase_timestamp AS DATE) = d.calendar_date
-
-LEFT JOIN items i
+-- Item summary
+LEFT JOIN item_summary i
     ON o.order_id = i.order_id
 
-LEFT JOIN payments p
+-- Payment summary
+LEFT JOIN payment_summary p
     ON o.order_id = p.order_id
 
-LEFT JOIN reviews r
+-- Review summary
+LEFT JOIN review_summary r
     ON o.order_id = r.order_id;
 
 GO
 
 
+-- -----------------------------------------------------------------------------
+-- Sanity check
+-- -----------------------------------------------------------------------------
 
+SELECT
+    COUNT(*) AS rows_in_view,
+    COUNT(DISTINCT order_id) AS distinct_orders
+FROM gold.fact_orders;
 
+GO
