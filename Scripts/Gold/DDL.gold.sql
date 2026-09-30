@@ -288,3 +288,113 @@ LEFT JOIN gold.dim_customers c
 LEFT JOIN gold.dim_date dd
     ON CAST(o.order_purchase_timestamp AS DATE) = dd.calendar_date;
 GO
+
+
+
+-- =============================================================================
+-- Gold Layer: gold.fact_orders
+-- =============================================================================
+-- Grain: one row per order.
+-- Combines item, payment and review information at order level
+-- to avoid double counting in business analysis and dashboards.
+-- =============================================================================
+
+IF OBJECT_ID('gold.fact_orders', 'V') IS NOT NULL
+    DROP VIEW gold.fact_orders;
+GO
+
+CREATE VIEW gold.fact_orders AS
+WITH items AS (
+    SELECT
+        order_id,
+        COUNT(*) AS item_count,
+        COUNT(DISTINCT seller_id) AS seller_count,
+        SUM(price) AS total_price,
+        SUM(freight_value) AS total_freight
+    FROM silver.order_items
+    GROUP BY order_id
+),
+payments AS (
+    SELECT
+        order_id,
+        SUM(payment_value) AS total_payment
+    FROM silver.order_payments
+    GROUP BY order_id
+),
+reviews AS (
+    SELECT
+        order_id,
+        AVG(review_score) AS review_score
+    FROM silver.order_reviews
+    GROUP BY order_id
+)
+
+SELECT
+    o.order_id,
+    c.customer_key,
+    c.customer_unique_id,
+    c.customer_state,
+
+    d.date_key AS purchase_date_key,
+
+    o.order_status,
+    o.order_purchase_timestamp,
+    o.order_delivered_customer_date,
+    o.order_estimated_delivery_date,
+
+    i.item_count,
+    i.seller_count,
+    i.total_price,
+    i.total_freight,
+
+    p.total_payment,
+
+    r.review_score,
+
+    CASE
+        WHEN o.order_status = 'delivered'
+         AND o.order_delivered_customer_date IS NOT NULL
+        THEN DATEDIFF(
+            DAY,
+            o.order_purchase_timestamp,
+            o.order_delivered_customer_date
+        )
+    END AS delivery_days,
+
+    CASE
+        WHEN o.order_status = 'delivered'
+         AND o.order_delivered_customer_date IS NOT NULL
+         AND o.order_delivered_customer_date > o.order_estimated_delivery_date
+        THEN 1
+        ELSE 0
+    END AS is_late,
+
+    CASE
+        WHEN i.order_id IS NULL
+          OR o.order_status IN ('canceled', 'unavailable')
+        THEN 0
+        ELSE 1
+    END AS is_valid_sale
+
+FROM silver.orders o
+
+LEFT JOIN gold.dim_customers c
+    ON o.customer_id = c.customer_id
+
+LEFT JOIN gold.dim_date d
+    ON CAST(o.order_purchase_timestamp AS DATE) = d.calendar_date
+
+LEFT JOIN items i
+    ON o.order_id = i.order_id
+
+LEFT JOIN payments p
+    ON o.order_id = p.order_id
+
+LEFT JOIN reviews r
+    ON o.order_id = r.order_id;
+
+GO
+
+
+
+
